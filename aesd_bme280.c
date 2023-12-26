@@ -11,6 +11,7 @@
 #include <linux/uaccess.h>
 #include <linux/jiffies.h>
 #include <linux/timer.h>
+#include <linux/mutex.h>
 
 #define I2C_BUS_AVAILABLE (1)
 #define AESD_DEVICE_NAME ("aesd_bm280")
@@ -30,11 +31,6 @@ static void __exit aesd_bme_driver_exit(void);
 static dev_t aesd_bme280_dev = 0;
 static struct class *dev_class;
 static struct cdev aesd_bme280_cdev;
-
-static struct timer_list aesd_bme280_timer;
-
-/* timer callback function before taking measurements */
-static void aesd_bme280_callback(struct timer_list *timer);
 
 /* bme280 sensor data */
 static struct bme280_sensor_data_s
@@ -62,8 +58,11 @@ static struct bme280_sensor_data_s
 	int32_t temperature;
 	uint32_t pressure;
 	uint32_t humidity;
+	bool device_was_already_read;
 }aesd_bme280_sensor_data;
 
+// mutex for allowing only one process to read the device file
+static DEFINE_MUTEX(aesd_bm280_device_mutex);
 
 /* fops function declarations */
 static int aesd_bme_open(struct inode *inode, struct file *file);
@@ -78,6 +77,7 @@ static int aesd_initialize_bm280_chip(void);
 static int aesd_read_comp_data(void);
 static int aesd_start_measurement(void);
 static int aesd_read_sensor_data(void);
+static int aesd_wait_for_completion(void);
 
 /* Compensation functions from Bosch BME280 data sheet */
 static int32_t BME280_compensate_T_int32(int32_t adc_T, int32_t *t_fine);
@@ -101,15 +101,55 @@ static int aesd_bme_open(struct inode *inode, struct file *file)
 
 static int aesd_bme_release(struct inode *inode, struct file *file)
 {
+	mutex_lock(&aesd_bm280_device_mutex);
 	pr_info("aesd_bme_release called\n");
+	aesd_bme280_sensor_data.device_was_already_read = false;
+	mutex_unlock(&aesd_bm280_device_mutex);
 	return 0;
 }
 
 static ssize_t aesd_bme_read(struct file *filp, char __user *buf, size_t len,
 			     loff_t *off)
 {
-	pr_info("aesd_bme_read called\n");
-	return 0;
+	size_t output_len;
+	char local_buf[100];
+	unsigned long not_copied;
+
+	mutex_lock(&aesd_bm280_device_mutex);
+	if(aesd_bme280_sensor_data.device_was_already_read){
+		// only output the device contents once
+		mutex_unlock(&aesd_bm280_device_mutex);
+		return 0;
+	}
+	aesd_bme280_sensor_data.device_was_already_read = true;
+
+	pr_info("aesd_bme_read with len=%lu called", len);
+	// section should probably secured with mutex, but as there is only
+	// one user of this module, it is not necessary
+	aesd_start_measurement();
+	aesd_wait_for_completion();
+	aesd_read_sensor_data();
+	sprintf(local_buf, "%d\n%u\n%u",
+		aesd_bme280_sensor_data.temperature,
+		aesd_bme280_sensor_data.humidity,
+		aesd_bme280_sensor_data.pressure);
+
+	output_len = strlen(local_buf);
+	pr_info("local_buf = %s, len = %lu ", local_buf, output_len);
+	if(output_len > len) {
+		output_len = len;
+	}
+
+	not_copied = copy_to_user(buf, local_buf, output_len);
+
+	if(not_copied != 0){
+		pr_err("Error copying all bytes to user space.");
+		mutex_unlock(&aesd_bm280_device_mutex);
+		return -EFAULT;
+	}
+
+	mutex_unlock(&aesd_bm280_device_mutex);
+	return output_len;
 }
 
 static ssize_t aesd_bme_write(struct file *filp, const char __user *buf,
@@ -165,16 +205,13 @@ int8_t i2c_reg_read(uint8_t i2c_addr, uint8_t reg_addr, uint8_t *reg_data,
 static int aesd_bme280_probe(struct i2c_client *client,
 			     const struct i2c_device_id *id)
 {
-
 	pr_info("aesd_bme280_probe called\n");
-
 	return 0;
 }
 
 /* this function is called once on driver removal */
 static void aesd_bme280_remove(struct i2c_client *client)
 {
-	// TODO: put sensor in sleep mode
 	pr_info("aesd_bme280_remove called\n");
 }
 
@@ -246,15 +283,12 @@ static int __init aesd_bme_driver_init(void)
 		i2c_put_adapter(aesd_bme_i2c_adapter);
 	}
 
-	
 	if(aesd_initialize_bm280_chip() != 0) {
 		pr_err("aesd_initialize_bm280_chip() failed");
 		ret = -1;
 	}
 
-	timer_setup(&aesd_bme280_timer, aesd_bme280_callback, 0);
-	mod_timer(&aesd_bme280_timer, jiffies + msecs_to_jiffies(1000));
-	aesd_start_measurement();
+	aesd_bme280_sensor_data.device_was_already_read = false;
 
 	pr_info("aesd bme280 module initialized\n");
 	return ret;
@@ -263,7 +297,6 @@ static int __init aesd_bme_driver_init(void)
 /* module exit function */
 static void __exit aesd_bme_driver_exit(void)
 {
-	del_timer(&aesd_bme280_timer);
 	i2c_unregister_device(aesd_bme_i2c_client);
 	i2c_del_driver(&aesd_bmp280_driver);
 	device_destroy(dev_class, aesd_bme280_dev);
@@ -278,10 +311,10 @@ static void __exit aesd_bme_driver_exit(void)
  */
 
 static int aesd_initialize_bm280_chip(void)
-{ 
+{
 	int8_t chip_id;
 	pr_info("aesd_initialize_bm280_chip called.");
-	
+
 	//int8_t i2c_reg_read(uint8_t i2c_addr, uint8_t reg_addr, uint8_t *reg_data, uint16_t length)
 	if(i2c_reg_read(I2C_SLAVE_ADDR, 0xD0, &chip_id, 1) != 0)
 	{
@@ -309,8 +342,10 @@ static int aesd_initialize_bm280_chip(void)
 
 static int aesd_read_comp_data(void)
 {
-	uint8_t register_contents[33];
-	if(i2c_reg_read(I2C_SLAVE_ADDR, 0x88, register_contents, 33) != 0)
+	uint8_t register_contents[24];
+	uint8_t tmp, tmp2;
+
+	if(i2c_reg_read(I2C_SLAVE_ADDR, 0x88, register_contents, 24) != 0)
 	{
 		pr_err("aesd_read_comp_data() failed.");
 	}
@@ -327,14 +362,52 @@ static int aesd_read_comp_data(void)
 	aesd_bme280_sensor_data.comp_data.dig_P7 = (register_contents[19] << 8) | register_contents[18];
 	aesd_bme280_sensor_data.comp_data.dig_P8 = (register_contents[21] << 8) | register_contents[20];
 	aesd_bme280_sensor_data.comp_data.dig_P9 = (register_contents[23] << 8) | register_contents[22];
-	
-	aesd_bme280_sensor_data.comp_data.dig_H1 = register_contents[24];
-	aesd_bme280_sensor_data.comp_data.dig_H2 = (register_contents[26] << 8) | register_contents[25];
-	aesd_bme280_sensor_data.comp_data.dig_H3 = register_contents[27];
-	aesd_bme280_sensor_data.comp_data.dig_H4 = (register_contents[29] << 8) | register_contents[28];
-	aesd_bme280_sensor_data.comp_data.dig_H5 = (register_contents[31] << 8) | register_contents[30];
-	aesd_bme280_sensor_data.comp_data.dig_H6 = register_contents[32];
-	
+
+
+	if(i2c_reg_read(I2C_SLAVE_ADDR, 0xA1, &tmp, 1) != 0)
+	{
+		pr_err("aesd_read_comp_data() failed.");
+	}
+	aesd_bme280_sensor_data.comp_data.dig_H1 = tmp;
+
+	if(i2c_reg_read(I2C_SLAVE_ADDR, 0xE1, &tmp, 1) != 0)
+	{
+		pr_err("aesd_read_comp_data() failed.");
+	}
+	if(i2c_reg_read(I2C_SLAVE_ADDR, 0xE2, &tmp2, 1) != 0)
+	{
+		pr_err("aesd_read_comp_data() failed.");
+	}
+	aesd_bme280_sensor_data.comp_data.dig_H2 = (tmp2 << 8) | tmp;
+
+	if(i2c_reg_read(I2C_SLAVE_ADDR, 0xE3, &tmp, 1) != 0)
+	{
+		pr_err("aesd_read_comp_data() failed.");
+	}
+	aesd_bme280_sensor_data.comp_data.dig_H3 = tmp;
+
+	if(i2c_reg_read(I2C_SLAVE_ADDR, 0xE4, &tmp, 1) != 0)
+	{
+		pr_err("aesd_read_comp_data() failed.");
+	}
+	if(i2c_reg_read(I2C_SLAVE_ADDR, 0xE5, &tmp2, 1) != 0)
+	{
+		pr_err("aesd_read_comp_data() failed.");
+	}
+	aesd_bme280_sensor_data.comp_data.dig_H4 = (tmp << 4) | (tmp2 & 0xF);
+
+	if(i2c_reg_read(I2C_SLAVE_ADDR, 0xE6, &tmp, 1) != 0)
+	{
+		pr_err("aesd_read_comp_data() failed.");
+	}
+	aesd_bme280_sensor_data.comp_data.dig_H5 = (tmp << 4) | tmp2>>4;
+
+	if(i2c_reg_read(I2C_SLAVE_ADDR, 0xE7, &tmp, 1) != 0)
+	{
+		pr_err("aesd_read_comp_data() failed.");
+	}
+	aesd_bme280_sensor_data.comp_data.dig_H6 = tmp;
+
 	pr_info("aesd_read_comp_data() finished");
 	return 0;
 }
@@ -359,36 +432,50 @@ static int aesd_start_measurement(void)
 
 static int aesd_read_sensor_data(void)
 {
-	// Data readout is done by starting a burst read from 0xF7 to 0xFC (temperature and pressure) or
-	// from 0xF7 to 0xFE (temperature, pressure and humidity). The data are read out in an unsigned
-	// 20-bit format both for pressure and for temperature and in an unsigned 16-bit format for
-	// humidity. It is strongly recommended to use the BME280 API, available from Bosch Sensortec,
-	// for readout and compensation. For details on memory map and interfaces, please consult
-	// chapters 5 and 6 respectively.
-	uint8_t sensor_data[8];
 	int32_t T_fine;	// for compensation acc. to data sheet
 	int32_t adc_P;
 	int32_t adc_T;
 	int32_t adc_H;
+	uint8_t t1,t2,t3;
 
 	pr_info("aesd_read_sensor_data");
-	
-	if(i2c_reg_read(I2C_SLAVE_ADDR, 0xF7, sensor_data, 8)!= 0)
-	{
-		pr_err("Error reading sensor data");
-		return -1;
-	}
 
-	adc_P = (sensor_data[0]<<12) | (sensor_data[1] << 4) | (sensor_data[2] >> 4);
-	adc_T = (sensor_data[3]<<12) | (sensor_data[4] << 4) | (sensor_data[5] >> 4);
-	adc_H = (sensor_data[6]<<8) | (sensor_data[7]) ;
+	i2c_reg_read(I2C_SLAVE_ADDR, 0xF7, &t1, 1);
+	i2c_reg_read(I2C_SLAVE_ADDR, 0xF8, &t2, 1);
+	i2c_reg_read(I2C_SLAVE_ADDR, 0xF9, &t3, 1);
+	adc_P = (t1 << 12) | (t2 << 4) | (t3 >> 4);
+
+	i2c_reg_read(I2C_SLAVE_ADDR, 0xFA, &t1, 1);
+	i2c_reg_read(I2C_SLAVE_ADDR, 0xFB, &t2, 1);
+	i2c_reg_read(I2C_SLAVE_ADDR, 0xFC, &t3, 1);
+	adc_T = (t1 << 12) | (t2 << 4) | (t3 >> 4);
+
+	i2c_reg_read(I2C_SLAVE_ADDR, 0xFD, &t1, 1);
+	i2c_reg_read(I2C_SLAVE_ADDR, 0xFE, &t2, 1);
+	adc_H = (t1 << 8) | (t2);
 
 	aesd_bme280_sensor_data.temperature = BME280_compensate_T_int32(adc_T, &T_fine);
-	aesd_bme280_sensor_data.pressure = BME280_compensate_P_int64(adc_P, T_fine);
 	aesd_bme280_sensor_data.humidity = BME280_compensate_H_int32(adc_H, T_fine);
+	aesd_bme280_sensor_data.pressure = BME280_compensate_P_int64(adc_P, T_fine);
 
-	pr_info("Read sensor data: %i, P: %u, H: %u", aesd_bme280_sensor_data.temperature, aesd_bme280_sensor_data.pressure, aesd_bme280_sensor_data.humidity);
 
+	return 0;
+}
+
+static int aesd_wait_for_completion(void)
+{
+	uint8_t status;
+	while(TRUE)
+	{
+		if(i2c_reg_read(I2C_SLAVE_ADDR, 0xF3, &status, 1) != 0) {
+			pr_err("aesd_wait_for_completion(): reading of status reg failed.");
+			return -1;
+		}
+		if((status & 0x08) == 0) {
+			// status bit "0" indicates measurement finished
+			break;
+		}
+	}
 	return 0;
 }
 
@@ -446,16 +533,6 @@ static uint32_t BME280_compensate_H_int32(int32_t adc_H, int32_t t_fine)
 	v_x1_u32r = (v_x1_u32r < 0 ? 0 : v_x1_u32r);
 	v_x1_u32r = (v_x1_u32r > 419430400 ? 419430400 : v_x1_u32r);
 	return (uint32_t)(v_x1_u32r>>12);
-}
-
-static void aesd_bme280_callback(struct timer_list *timer)
-{
-	pr_info("aesd_bme280_callback");
-	if(aesd_read_sensor_data() != 0)
-	{
-		pr_err("Error while reading sensor data");
-	}
-	mod_timer(&aesd_bme280_timer, jiffies + msecs_to_jiffies(1000));
 }
 
 module_init(aesd_bme_driver_init);
