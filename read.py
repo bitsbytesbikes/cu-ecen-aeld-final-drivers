@@ -2,6 +2,7 @@ import json
 import time
 import serial
 import io
+import requests
 
 hostname = ""
 with open("/etc/hostname") as host_file:
