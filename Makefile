@@ -1,8 +1,14 @@
 obj-m += aesd_bme280.o
 
-KDIR = /lib/modules/$(shell uname -r)/build
+SRC := $(shell pwd)
 
 all:
-	make -C $(KDIR)  M=$(shell pwd) modules
+	$(MAKE) -C $(KERNEL_SRC) M=$(SRC)
+
+modules_install:
+	$(MAKE) -C $(KERNEL_SRC) M=$(SRC) modules_install
+
 clean:
-	make -C $(KDIR)  M=$(shell pwd) clean
+	rm -f *.o *~ core .depend .*.cmd *.ko *.mod.c
+	rm -f Module.markers Module.symvers modules.order
+	rm -rf .tmp_versions Modules.symvers
