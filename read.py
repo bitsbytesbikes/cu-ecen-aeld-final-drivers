@@ -42,11 +42,15 @@ while True:
         #print(f"Humidity:\t\t{int(hum_s)/1024} %rel")
         #print(f"Pressure:\t\t{int(pres_s)/256} hPa")
         json_data = {
-            "location": location,
-            "station": hostname,
+            "nmea": location,
+            "name": hostname,
             "temperature": int(temp_s)/100,
             "humidity": int(hum_s)/1024,
-            "pressure": int(pres_s)/256
+            "pressure": int(pres_s)/(256*100.0)
         }
         print(json.dumps(json_data))
+        try:
+            requests.post('http://rpi5:5000/new_location', json=json_data)
+        except:
+            print("Error: cannot reach endpoint")
 
